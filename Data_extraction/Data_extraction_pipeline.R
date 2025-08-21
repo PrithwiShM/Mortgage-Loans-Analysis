@@ -3,24 +3,18 @@ library(dplyr)
 library(tidyr)
 setDTthreads(threads = 4)
 
-lppub_column_names <- readLines("sf_column_names.txt")
-lppub_column_classes <- readLines("sf_column_classes.txt")
-sfp_na_columns <- readLines("sfp_na_columns.txt")
+lppub_column_names   <- readLines("sf_column_names.txt")   # full schema, in order
+lppub_column_classes <- readLines("sf_column_classes.txt") # optional; aligns to the above
+# helper: "MMYYYY" -> integer YYYYMM (e.g., "012018" -> 201801)
+to_yyyymm <- function(s) as.integer(sub("^([0-9]{2})([0-9]{4})$", "\\2\\1", s))
 
+FileName <- "2004Q1"
+# --- Inputs ---------------------------------------------------------------
+zip_path <- file.path("../raw_data", paste0(FileName, ".zip"))
+csv_name <- paste0(FileName, ".csv")
+cmd <- sprintf("unzip -p %s %s", shQuote(zip_path), shQuote(csv_name))
 
-Zip_FileName <- paste("unzip -p ", "../raw_data/", FileName, ".zip " , FileName, ".csv", sep = '')
-
-## Load Loan Performance file
-lppub_file <- fread(Zip_FileName, sep = "|", col.names = lppub_column_names, colClasses = lppub_column_classes)
-
-# Drop the null columns, which are not populated here-
-lppub_file <- lppub_file[, !sfp_na_columns, with = FALSE] %>% 
-  mutate(
-  ACT_PERIOD = as.numeric(paste(substr(ACT_PERIOD, 3, 6), substr(ACT_PERIOD, 1, 2),sep = "")),
-  ORIG_RATE = as.numeric(ORIG_RATE), ### Ensure interest rate columns are treated as numeric
-  CURR_RATE = as.numeric(CURR_RATE)
-)
-
+###################################### acquisition_data extraction ##################
 # Define the list of Acquisition (Static) columns
 acquisition_columns <- c(
   "LOAN_ID", "CHANNEL", "ACT_PERIOD", "SELLER", "ORIG_RATE", "ORIG_UPB", "ORIG_TERM", 
@@ -32,96 +26,130 @@ acquisition_columns <- c(
   "HIGH_LOAN_TO_VALUE_HLTV_REFINANCE_OPTION_INDICATOR", "DEAL_NAME"
 )
 
+# indices of those columns in the raw file
+sel_idx <- match(acquisition_columns, lppub_column_names)
+if (anyNA(sel_idx)) {
+  stop("These requested columns were not found in sf_column_names.txt: ",
+       paste(acq_cols[is.na(sel_idx)], collapse = ", "))
+}
+
+types_selected <- lppub_column_classes[sel_idx]     # e.g. "character","numeric",...
+cc_list <- split(sel_idx, types_selected)    
+
 # Select the acquisition columns from the original data table
-acquisition_data <- lppub_file[, ..acquisition_columns] %>%
-  rename(
-    ORIG_CHN = CHANNEL,
-    orig_rt = ORIG_RATE,
-    orig_amt = ORIG_UPB,
-    orig_trm = ORIG_TERM,
-    oltv = OLTV,
-    ocltv = OCLTV,
-    num_bo = NUM_BO,
-    dti = DTI,
-    FTHB_FLG = FIRST_FLAG,
-    purpose = PURPOSE,
-    PROP_TYP = PROP,
-    NUM_UNIT = NO_UNITS,
-    occ_stat = OCC_STAT,
-    state = STATE,
-    zip_3 = ZIP,
-    msa = MSA,
-    mi_pct = MI_PCT,
-    prod_type = PRODUCT,
-    relo_flg = RELOCATION_MORTGAGE_INDICATOR,
-    hrp_ind = HOMEREADY_PROGRAM_INDICATOR,
-    prop_ins_ind = PROPERTY_INSPECTION_WAIVER_INDICATOR,
-    hbl_ind = HIGH_BALANCE_LOAN_INDICATOR,
-    hltv_ref_ind = HIGH_LOAN_TO_VALUE_HLTV_REFINANCE_OPTION_INDICATOR
-  )
+DT <-  fread(
+  cmd = cmd,
+  sep = "|",
+  header    = FALSE,          # raw file has no header
+  select    = sel_idx,        # select by position to avoid name-mismatch
+  colClasses  = cc_list,    # force types by those names
+  na.strings = c("", "NA"),
+  showProgress = TRUE
+)
+setnames(DT, names(DT), acquisition_columns)
+#
 
-acquisition_data <- acquisition_data %>%
-  group_by(LOAN_ID) %>%
-  filter(ACT_PERIOD == max(ACT_PERIOD)) %>%
-  ungroup() %>%
-  mutate(
-    FIRST_PAY = as.numeric(paste(substr(FIRST_PAY, 3, 6), substr(FIRST_PAY, 1, 2), sep = "")),
-    ORIG_DATE = as.numeric(paste(substr(ORIG_DATE, 3, 6), substr(ORIG_DATE, 1, 2), sep = "")),
-  )
+# --- Rename columns in-place ----------------------------------------------
+setnames(DT,
+         old = c("CHANNEL","ORIG_RATE","ORIG_UPB","ORIG_TERM","OLTV","OCLTV","NUM_BO",
+                 "DTI","FIRST_FLAG","PURPOSE","PROP","NO_UNITS","OCC_STAT","STATE","ZIP",
+                 "MSA","MI_PCT","PRODUCT",
+                 "RELOCATION_MORTGAGE_INDICATOR","HOMEREADY_PROGRAM_INDICATOR",
+                 "PROPERTY_INSPECTION_WAIVER_INDICATOR","HIGH_BALANCE_LOAN_INDICATOR",
+                 "HIGH_LOAN_TO_VALUE_HLTV_REFINANCE_OPTION_INDICATOR"),
+         new = c("ORIG_CHN","orig_rt","orig_amt","orig_trm","oltv","ocltv","num_bo",
+                 "dti","FTHB_FLG","purpose","PROP_TYP","NUM_UNIT","occ_stat","state","zip_3",
+                 "msa","mi_pct","prod_type",
+                 "relo_flg","hrp_ind",
+                 "prop_ins_ind","hbl_ind",
+                 "hltv_ref_ind")
+)
 
+DT[, `:=`(
+  ACT_PERIOD = to_yyyymm(ACT_PERIOD),
+  FIRST_PAY  = to_yyyymm(FIRST_PAY),
+  ORIG_DATE  = to_yyyymm(ORIG_DATE)
+)]
 
-############################# acquisition_data completed ############################################
+# --- Keep the latest record per LOAN_ID (max ACT_PERIOD) ------------------
+setorder(DT, LOAN_ID, ACT_PERIOD)        # sort by id, then period
+acquisition_data <- DT[, .SD[.N], by = LOAN_ID]  # last row per id = max period
+
+rm(DT); gc()
+
+#############################  performance_data extraction ############################################
 
 # Add the remaining 9 variables some how here.
 ### Prepare the Performance variables
-performanceData <- lppub_file %>%
-  arrange(LOAN_ID, ACT_PERIOD) %>%
-  select(LOAN_ID, ACT_PERIOD, SERVICER, CURR_RATE, CURRENT_UPB,
-         LOAN_AGE, REM_MONTHS, ADJ_REM_MONTHS, MATR_DT,
-         DLQ_STATUS, MOD_FLAG, Zero_Bal_Code, ZB_DTE, LAST_PAID_INSTALLMENT_DATE,
-         FORECLOSURE_DATE, DISPOSITION_DATE, FORECLOSURE_COSTS, PROPERTY_PRESERVATION_AND_REPAIR_COSTS, ASSET_RECOVERY_COSTS,
-         MISCELLANEOUS_HOLDING_EXPENSES_AND_CREDITS, ASSOCIATED_TAXES_FOR_HOLDING_PROPERTY, NET_SALES_PROCEEDS, CREDIT_ENHANCEMENT_PROCEEDS, REPURCHASES_MAKE_WHOLE_PROCEEDS,
-         OTHER_FORECLOSURE_PROCEEDS, NON_INTEREST_BEARING_UPB, PRINCIPAL_FORGIVENESS_AMOUNT, LAST_UPB) %>%
-  rename(
-    period = ACT_PERIOD,
-    servicer = SERVICER,
-    curr_rte = CURR_RATE,
-    curr_upb = CURRENT_UPB,
-    loan_age = LOAN_AGE,
-    rem_mths = REM_MONTHS,
-    adj_rem_months = ADJ_REM_MONTHS,
-    maturity_date = MATR_DT,
-    dlq_status =DLQ_STATUS,
-    mod_ind = MOD_FLAG,
-    z_zb_code = Zero_Bal_Code,
-    zb_date = ZB_DTE,
-    lpi_dte = LAST_PAID_INSTALLMENT_DATE,
-    fcc_dte = FORECLOSURE_DATE,
-    disp_dte = DISPOSITION_DATE,
-    FCC_COST = FORECLOSURE_COSTS,
-    PP_COST = PROPERTY_PRESERVATION_AND_REPAIR_COSTS,
-    AR_COST = ASSET_RECOVERY_COSTS,
-    IE_COST = MISCELLANEOUS_HOLDING_EXPENSES_AND_CREDITS,
-    TAX_COST = ASSOCIATED_TAXES_FOR_HOLDING_PROPERTY,
-    NS_PROCS = NET_SALES_PROCEEDS,
-    CE_PROCS = CREDIT_ENHANCEMENT_PROCEEDS,
-    RMW_PROCS = REPURCHASES_MAKE_WHOLE_PROCEEDS,
-    O_PROCS = OTHER_FORECLOSURE_PROCEEDS,
-    non_int_upb = NON_INTEREST_BEARING_UPB,
-    prin_forg_upb = PRINCIPAL_FORGIVENESS_AMOUNT,
-    zb_upb = LAST_UPB
-  )
+performance_columns <- c("LOAN_ID", "ACT_PERIOD", "SERVICER", "CURR_RATE", "CURRENT_UPB",
+ "LOAN_AGE", "REM_MONTHS", "ADJ_REM_MONTHS", "MATR_DT",
+ "DLQ_STATUS", "MOD_FLAG", "Zero_Bal_Code", "ZB_DTE", "LAST_PAID_INSTALLMENT_DATE",
+ "FORECLOSURE_DATE", "DISPOSITION_DATE", "FORECLOSURE_COSTS", "PROPERTY_PRESERVATION_AND_REPAIR_COSTS", "ASSET_RECOVERY_COSTS",
+ "MISCELLANEOUS_HOLDING_EXPENSES_AND_CREDITS", "ASSOCIATED_TAXES_FOR_HOLDING_PROPERTY", "NET_SALES_PROCEEDS", "CREDIT_ENHANCEMENT_PROCEEDS", "REPURCHASES_MAKE_WHOLE_PROCEEDS",
+ "OTHER_FORECLOSURE_PROCEEDS", "NON_INTEREST_BEARING_UPB", "PRINCIPAL_FORGIVENESS_AMOUNT", "LAST_UPB")
 
-rm(lppub_file)
+# indices of those columns in the raw file
+sel_idx <- match(performance_columns, lppub_column_names)
+if (anyNA(sel_idx)) {
+  stop("These requested columns were not found in sf_column_names.txt: ",
+       paste(acq_cols[is.na(sel_idx)], collapse = ", "))
+}
 
-performanceData <- performanceData %>%
-  mutate( #check whether the first one is working or not
-    maturity_date = paste(substr(maturity_date, 3, 6), substr(maturity_date, 1, 2), '01', sep = '-'),
-    zb_date = as.numeric(paste(substr(zb_date, 3, 6), substr(zb_date, 1, 2), sep = "")),
-    lpi_dte = as.numeric(paste(substr(lpi_dte, 3, 6), substr(lpi_dte, 1, 2), sep = "")),
-    fcc_dte = as.numeric(paste(substr(fcc_dte, 3, 6), substr(fcc_dte, 1, 2), sep = "")),
-    disp_dte = as.numeric(paste(substr(disp_dte, 3, 6), substr(disp_dte, 1, 2), sep = "")),
-  )
+types_selected <- lppub_column_classes[sel_idx]     # e.g. "character","numeric",...
+cc_list <- split(sel_idx, types_selected) 
+
+# Read and Select the performance columns from the original data table
+performanceData <-  fread(
+  cmd = cmd,
+  sep = "|",
+  header    = FALSE,          # raw file has no header
+  select    = sel_idx,        # select by position to avoid name-mismatch
+  colClasses  = cc_list,    # force types by those names
+  na.strings = c("", "NA"),
+  showProgress = TRUE
+)
+setnames(performanceData, names(performanceData), performance_columns)
+ 
+# assign the proper names to just the selected columns
+setnames(performanceData, 
+         old = c(
+           "ACT_PERIOD", "SERVICER", "CURR_RATE", "CURRENT_UPB",
+           "LOAN_AGE", "REM_MONTHS", "ADJ_REM_MONTHS", "MATR_DT",
+           "DLQ_STATUS", "MOD_FLAG", "Zero_Bal_Code", "ZB_DTE",
+           "LAST_PAID_INSTALLMENT_DATE", "FORECLOSURE_DATE", "DISPOSITION_DATE",
+           "FORECLOSURE_COSTS", "PROPERTY_PRESERVATION_AND_REPAIR_COSTS", "ASSET_RECOVERY_COSTS",
+           "MISCELLANEOUS_HOLDING_EXPENSES_AND_CREDITS", "ASSOCIATED_TAXES_FOR_HOLDING_PROPERTY",
+           "NET_SALES_PROCEEDS", "CREDIT_ENHANCEMENT_PROCEEDS", "REPURCHASES_MAKE_WHOLE_PROCEEDS",
+           "OTHER_FORECLOSURE_PROCEEDS", "NON_INTEREST_BEARING_UPB", "PRINCIPAL_FORGIVENESS_AMOUNT",
+           "LAST_UPB"
+         ),
+          new = c(
+          "period", "servicer", "curr_rte", "curr_upb",
+           "loan_age", "rem_mths", "adj_rem_months", "maturity_date",
+           "dlq_status", "mod_ind", "z_zb_code", "zb_date",
+           "lpi_dte", "fcc_dte", "disp_dte",
+           "FCC_COST", "PP_COST", "AR_COST",
+           "IE_COST", "TAX_COST",
+           "NS_PROCS", "CE_PROCS", "RMW_PROCS",
+           "O_PROCS", "non_int_upb", "prin_forg_upb",
+           "zb_upb"
+         ),
+         skip_absent = TRUE)
+
+performanceData[, `:=`(
+  period = to_yyyymm(period),
+  zb_date = to_yyyymm(zb_date),
+  lpi_dte  = to_yyyymm(lpi_dte),
+  fcc_dte  = to_yyyymm(fcc_dte),
+  disp_dte  = to_yyyymm(disp_dte)
+)]
+
+performanceData[, maturity_date := 
+                  paste0(substr(maturity_date, 3, 6), "-",   # YYYY
+                         substr(maturity_date, 1, 2), "-",   # MM
+                         "01")]                              # fixed day
+
+#############################  Other Feature extraction ############################################
 
 ### Create AQSN_DTE field from filename
 acquisition_year <- substr(FileName, 1, 4)
@@ -196,6 +224,7 @@ rm(last_rt_table)
 rm(zb_code_table)
 rm(servicer_table)
 rm(non_int_upb_table)
+gc()
 
 ### Create the third base table with the latest-available forclosure/disposition data
 fcc_table <- performanceData %>%
@@ -215,6 +244,13 @@ rm(fcc_table)
 
 # taken care of - zb_upb, curr_rte, period, z_zb_code, servicer, non_int_upb, lpi_dte, fcc_dte, disp_dte
 
+### computing loan status fields according to specific rules
+costs_otherupbs_table <- performanceData %>% 
+  group_by(LOAN_ID) %>% filter(period == max(period)) %>% ungroup() %>%
+  select(LOAN_ID, prin_forg_upb, mod_ind, dlq_status, zb_date, FCC_COST,
+         PP_COST, AR_COST, IE_COST, TAX_COST, NS_PROCS, CE_PROCS, RMW_PROCS, O_PROCS,) %>% 
+  rename(PFG_COST = prin_forg_upb)
+
 ### Create the forth base table -Delinquency data, Final Closure Event data and modification data
 slimperformanceData <- performanceData %>%
   select(LOAN_ID, period, dlq_status, z_zb_code, curr_upb, zb_upb, mod_ind, maturity_date, rem_mths) %>%
@@ -223,6 +259,8 @@ slimperformanceData <- performanceData %>%
     dlq_status = as.numeric(dlq_status)
   )
 
+rm(performanceData); gc();
+
 consolidated_dlq_table <- slimperformanceData %>%
   mutate(dlq_status = if_else(dlq_status > 6, 6, dlq_status)) %>%  # Adjust dlq_status
   filter(dlq_status %in% c(1, 2, 3, 4, 6)) %>%  # Ensure only relevant dlq_status (1 to 4 and 6) 
@@ -230,6 +268,7 @@ consolidated_dlq_table <- slimperformanceData %>%
   select(LOAN_ID, dlq_status, DTE = period, curr_upb) 
 
 # Step 2: Pivot wider to create columns for each dlq_status and its corresponding DTE and curr_upb
+# Note : This pivoting only concerns with inserting the data in 1 column, not all columns greater than
 consolidated_dlq_table <- consolidated_dlq_table %>%
   pivot_wider(names_from = dlq_status, values_from = c(DTE, curr_upb), 
               names_glue = "F{dlq_status}_{.value}") 
@@ -243,14 +282,15 @@ fce_table <- slimperformanceData %>%
   select(LOAN_ID, FCE_DTE, FCE_UPB)
 
 fmod_dte_table <- slimperformanceData %>%
-  filter(mod_ind == 'Y', z_zb_code == '') %>%
+  filter(mod_ind == "Y", is.na(z_zb_code)) %>%
   group_by(LOAN_ID) %>%
-  summarize(FMOD_DTE = min(period))
+  summarize(FMOD_DTE =  min(period))
 
 #this table contains maximum UPB in a period from 1st modification to 3 months after 1st modification
 fmod_table <- slimperformanceData %>%
-  filter(mod_ind == 'Y', z_zb_code == '') %>%
+  filter(mod_ind == 'Y', is.na(z_zb_code)) %>%
   left_join(fmod_dte_table, by = c("LOAN_ID" = "LOAN_ID")) %>%
+  mutate(period   = as.integer(period), FMOD_DTE = as.integer(FMOD_DTE)) %>%
   filter((period %/% 100)*12 + period %% 100  <=  (FMOD_DTE %/% 100)*12 + FMOD_DTE %% 100 + 3) %>%
   group_by(LOAN_ID) %>%
   slice_max(curr_upb, with_ties = FALSE) %>% ungroup() %>% # Keep only one row per LOAN_ID
@@ -260,10 +300,11 @@ rm(fmod_dte_table)
 
 ### Compute the number of months elapsed from origination to a loan becoming at least 120 days delinquent
 num_120_table <- slimperformanceData %>%
-  filter(dlq_status >= 4 & dlq_status < 999, z_zb_code == '') %>%
+  filter(dlq_status >= 4 & dlq_status < 999,is.na(z_zb_code)) %>%
   group_by(LOAN_ID) %>%
   summarize(F120_DTE = min(period)) %>%
   left_join(acquisition_data, by = 'LOAN_ID') %>%
+  
   mutate(
     z_num_months_120 = ((F120_DTE %/% 100)*12 + F120_DTE %% 100 - ((FIRST_PAY %/% 100)*12 + FIRST_PAY %% 100) + 1)
   ) %>%
@@ -295,6 +336,7 @@ modtrm_table <- fmod_table %>%
 
 rm(orig_maturity_table)
 rm(trm_chng_table)
+rm(acquisition_data)
 
 ### Compute MODTRM_UPB field (a flag for whether the balance of a loan was changed as part of a loan modification)
 pre_mod_upb_table <- slimperformanceData %>%
@@ -341,13 +383,8 @@ rm(modupb_table)
 # dlq_status, z_zb_code, curr_upb, zb_upb, mod_ind, maturity_date, rem_mths should be taken care of
 # dlq_status - +10 rows, zb_upb, curr_upb - 1 row , mod_ind, curr_upb for max(3 mm..)
 
-### Create the fifth base table by computing loan status fields according to specific rules
-costs_otherupbs_table <- performanceData %>% 
-  group_by(LOAN_ID) %>% filter(period == max(period)) %>% ungroup() %>%
-  select(LOAN_ID, prin_forg_upb, mod_ind, dlq_status, zb_date, FCC_COST,
-         PP_COST, AR_COST, IE_COST, TAX_COST, NS_PROCS, CE_PROCS, RMW_PROCS, O_PROCS,) %>% 
-  rename(PFG_COST = prin_forg_upb)
-  
+
+### Create the fifth base table
 baseTable5 <- baseTable4 %>%
   left_join(costs_otherupbs_table, by = 'LOAN_ID') %>%
   mutate(
@@ -383,6 +420,7 @@ baseTable5 <- baseTable4 %>%
 
 # unter the gun, DISP_DTE, LAST_ACTIVITY_DATE
 rm(baseTable4)
+rm(costs_otherupbs_table)
 
 #date columns formatting -
 baseTable5 <- baseTable5 %>%
@@ -407,3 +445,5 @@ baseTable5 <- baseTable5 %>%
 baseTable5 %>%
   dplyr::mutate_if(is.double, function(x) dplyr::if_else(is.na(x), NA_character_, format(x, scientific = FALSE, drop0trailing = TRUE, trim = TRUE))) %>%
   data.table::fwrite(paste0("../preprocessed_data/", FileName, "_stat.csv"), sep = ",", na = "NULL", logical01 = TRUE, quote = TRUE, scipen = 100, col.names = TRUE, row.names = FALSE)
+
+rm(baseTable5)
