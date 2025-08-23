@@ -1,4 +1,5 @@
+.ipynb_checkpoints/
 raw_data/
-preprocessed_data/
+preprocessed_data/*.csv
 Data_extraction/.RData
 Data_extraction/.Rhistory

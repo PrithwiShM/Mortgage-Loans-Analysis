@@ -1,7 +1,7 @@
 
 ### Define the set of files to read in. PLEASE EDIT TO ACCOMODATE YOUR ANALYSIS AND INCLUDE LATER DATA RELEASES ###
-starting_file <- 16 #0 starts on 2000Q1
-ending_file <- 19 #95 ends on 2023Q4
+starting_file <- 17 #0 starts on 2000Q1
+ending_file <- 27 #95 ends on 2023Q4
 
 #Process the files (outputs to csv)
 for (file_number in starting_file:ending_file){
@@ -18,6 +18,6 @@ for (file_number in starting_file:ending_file){
   
   print(paste("Starting Data Extraction from -", FileName))
   #Run helper file
-  source('My_data_extraction_tool.R')
+  source('Data_extraction_pipeline.R')
   print(paste("Completed Data Extraction from -", FileName))
 }

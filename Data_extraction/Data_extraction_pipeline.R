@@ -8,7 +8,6 @@ lppub_column_classes <- readLines("sf_column_classes.txt") # optional; aligns to
 # helper: "MMYYYY" -> integer YYYYMM (e.g., "012018" -> 201801)
 to_yyyymm <- function(s) as.integer(sub("^([0-9]{2})([0-9]{4})$", "\\2\\1", s))
 
-FileName <- "2004Q1"
 # --- Inputs ---------------------------------------------------------------
 zip_path <- file.path("../raw_data", paste0(FileName, ".zip"))
 csv_name <- paste0(FileName, ".csv")
@@ -422,6 +421,7 @@ baseTable5 <- baseTable4 %>%
 rm(baseTable4)
 rm(costs_otherupbs_table)
 
+#check what all formatting needs to be done after basetable4 to create basetable5?
 #date columns formatting -
 baseTable5 <- baseTable5 %>%
   mutate(ORIG_DATE = if_else(!is.na(ORIG_DATE), paste(as.character(ORIG_DATE %/% 100), as.character(ORIG_DATE %% 100), '01', sep = '-'), ''),
